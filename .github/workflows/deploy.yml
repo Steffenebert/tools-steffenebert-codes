@@ -8,8 +8,10 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup SSH
         run: |
@@ -24,7 +26,10 @@ jobs:
           set -e
           export DEBIAN_FRONTEND=noninteractive
 
-          # Skip if docker is already installed and running
+          # Clean up any stale Docker repo config from previous runs
+          rm -f /etc/apt/sources.list.d/docker.list
+          rm -f /usr/share/keyrings/docker-archive-keyring.gpg
+
           if command -v docker &> /dev/null && systemctl is-active --quiet docker; then
             echo "Docker already installed and running, skipping."
             exit 0
@@ -33,12 +38,11 @@ jobs:
           apt-get update
           apt-get install -y ca-certificates curl gnupg lsb-release
 
-          # Add Docker GPG key (idempotent with --yes)
           install -m 0755 -d /etc/apt/keyrings
-          curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
           chmod a+r /etc/apt/keyrings/docker.gpg
 
-          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
 
           apt-get update
           apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
@@ -51,13 +55,12 @@ jobs:
           ssh root@213.165.87.47 "mkdir -p /root/deploy"
           rsync -av --delete --exclude='.git' --exclude='certbot' ./ root@213.165.87.47:/root/deploy/
 
-      - name: Configure and start (handles HTTP-only vs HTTPS)
+      - name: Configure and start
         run: |
           ssh root@213.165.87.47 'bash -s' << 'SCRIPT'
           set -e
           cd /root/deploy
 
-          # Check if certs already exist
           if [ -f "certbot/conf/live/tools.steffenebert.codes/fullchain.pem" ]; then
             echo "Certs exist, using HTTPS config."
             cp nginx/default.conf nginx/active.conf
@@ -75,7 +78,6 @@ jobs:
           set -e
           cd /root/deploy
 
-          # Skip if certs already exist
           if [ -f "certbot/conf/live/tools.steffenebert.codes/fullchain.pem" ]; then
             echo "Certs already exist, skipping certbot."
             exit 0
@@ -83,11 +85,9 @@ jobs:
 
           mkdir -p certbot/conf certbot/www
 
-          # Wait for nginx to be ready
           echo "Waiting for nginx..."
           sleep 5
 
-          # Run certbot (no -it flag!)
           docker run --rm \
             -v $PWD/certbot/conf:/etc/letsencrypt \
             -v $PWD/certbot/www:/var/www/certbot \
@@ -100,7 +100,6 @@ jobs:
             --no-eff-email \
             --non-interactive
 
-          # Switch to HTTPS config and restart
           cp nginx/default.conf nginx/active.conf
           docker compose up -d --force-recreate
           echo "HTTPS enabled!"
@@ -109,7 +108,6 @@ jobs:
       - name: Setup automatic cert renewal
         run: |
           ssh root@213.165.87.47 'bash -s' << 'SCRIPT'
-          # Add cron job for cert renewal if not already present
           CRON_CMD="0 3 * * 0 cd /root/deploy && docker run --rm -v \$PWD/certbot/conf:/etc/letsencrypt -v \$PWD/certbot/www:/var/www/certbot certbot/certbot renew --quiet && docker compose restart web"
           (crontab -l 2>/dev/null | grep -v "certbot renew" ; echo "$CRON_CMD") | crontab -
           echo "Cert renewal cron job configured."
