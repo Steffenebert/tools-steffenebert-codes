@@ -1,0 +1,116 @@
+name: Full Deploy Strato Server
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H 213.165.87.47 >> ~/.ssh/known_hosts
+
+      - name: Install Docker on server
+        run: |
+          ssh root@213.165.87.47 'bash -s' << 'SCRIPT'
+          set -e
+          export DEBIAN_FRONTEND=noninteractive
+
+          # Skip if docker is already installed and running
+          if command -v docker &> /dev/null && systemctl is-active --quiet docker; then
+            echo "Docker already installed and running, skipping."
+            exit 0
+          fi
+
+          apt-get update
+          apt-get install -y ca-certificates curl gnupg lsb-release
+
+          # Add Docker GPG key (idempotent with --yes)
+          install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
+          chmod a+r /etc/apt/keyrings/docker.gpg
+
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
+
+          apt-get update
+          apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+          systemctl enable docker
+          systemctl start docker
+          SCRIPT
+
+      - name: Deploy files
+        run: |
+          ssh root@213.165.87.47 "mkdir -p /root/deploy"
+          rsync -av --delete --exclude='.git' --exclude='certbot' ./ root@213.165.87.47:/root/deploy/
+
+      - name: Configure and start (handles HTTP-only vs HTTPS)
+        run: |
+          ssh root@213.165.87.47 'bash -s' << 'SCRIPT'
+          set -e
+          cd /root/deploy
+
+          # Check if certs already exist
+          if [ -f "certbot/conf/live/tools.steffenebert.codes/fullchain.pem" ]; then
+            echo "Certs exist, using HTTPS config."
+            cp nginx/default.conf nginx/active.conf
+          else
+            echo "No certs yet, using HTTP-only config."
+            cp nginx/default-http-only.conf nginx/active.conf
+          fi
+
+          docker compose up -d --force-recreate
+          SCRIPT
+
+      - name: Obtain SSL certificate (if needed)
+        run: |
+          ssh root@213.165.87.47 'bash -s' << 'SCRIPT'
+          set -e
+          cd /root/deploy
+
+          # Skip if certs already exist
+          if [ -f "certbot/conf/live/tools.steffenebert.codes/fullchain.pem" ]; then
+            echo "Certs already exist, skipping certbot."
+            exit 0
+          fi
+
+          mkdir -p certbot/conf certbot/www
+
+          # Wait for nginx to be ready
+          echo "Waiting for nginx..."
+          sleep 5
+
+          # Run certbot (no -it flag!)
+          docker run --rm \
+            -v $PWD/certbot/conf:/etc/letsencrypt \
+            -v $PWD/certbot/www:/var/www/certbot \
+            certbot/certbot certonly \
+            --webroot \
+            --webroot-path=/var/www/certbot \
+            -d tools.steffenebert.codes \
+            --email 9Steffenebert8@gmail.com \
+            --agree-tos \
+            --no-eff-email \
+            --non-interactive
+
+          # Switch to HTTPS config and restart
+          cp nginx/default.conf nginx/active.conf
+          docker compose up -d --force-recreate
+          echo "HTTPS enabled!"
+          SCRIPT
+
+      - name: Setup automatic cert renewal
+        run: |
+          ssh root@213.165.87.47 'bash -s' << 'SCRIPT'
+          # Add cron job for cert renewal if not already present
+          CRON_CMD="0 3 * * 0 cd /root/deploy && docker run --rm -v \$PWD/certbot/conf:/etc/letsencrypt -v \$PWD/certbot/www:/var/www/certbot certbot/certbot renew --quiet && docker compose restart web"
+          (crontab -l 2>/dev/null | grep -v "certbot renew" ; echo "$CRON_CMD") | crontab -
+          echo "Cert renewal cron job configured."
+          SCRIPT
